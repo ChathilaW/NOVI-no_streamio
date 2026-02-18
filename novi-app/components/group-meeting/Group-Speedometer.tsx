@@ -1,49 +1,58 @@
 import ReactSpeedometer from 'react-d3-speedometer';
 
 type SpeedometerProps = {
-  percentage: number; // 0-100
+  distractedCount: number;
+  totalCount: number;
 };
 
-export default function Speedometer({ percentage }: SpeedometerProps) {
-  // Clamp percentage between 0 and 100
-  const clampedPercentage = Math.max(0, Math.min(100, percentage));
-  
-  // Determine color based on percentage
+export default function GroupSpeedometer({ distractedCount, totalCount }: SpeedometerProps) {
+  // Distraction percentage: 0 = nobody distracted, 100 = everyone distracted
+  const distractionPct = totalCount > 0 ? (distractedCount / totalCount) * 100 : 0;
+  const clamped = Math.max(0, Math.min(100, distractionPct));
+
+  // Color: green (low distraction) → yellow → red (high distraction)
   const getColor = (pct: number) => {
-    if (pct < 40) return '#ef4444'; // Red
-    if (pct < 70) return '#eab308'; // Yellow
-    return '#22c55e'; // Green
+    if (pct < 30) return '#22c55e';  // green
+    if (pct < 60) return '#eab308';  // yellow
+    return '#ef4444';                // red
   };
 
-  const color = getColor(clampedPercentage);
+  const color = getColor(clamped);
 
   return (
-    <div className="flex flex-col items-center mb-4">
+    <div className="flex flex-col items-center">
       <ReactSpeedometer
         key={color}
-        value={clampedPercentage}
+        value={clamped}
         minValue={0}
         maxValue={100}
-        width={260}
-        height={180}
+        width={240}
+        height={160}
         needleColor={color}
-        startColor={color}
-        segments={1}
-        endColor={color}
-        segmentColors={[color]}
-        ringWidth={30}
+        startColor="#22c55e"
+        endColor="#ef4444"
+        segments={3}
+        segmentColors={['#22c55e', '#eab308', '#ef4444']}
+        ringWidth={28}
         needleHeightRatio={0.7}
         needleTransitionDuration={0}
         currentValueText=""
         textColor="transparent"
       />
-      
-      {/* Percentage display */}
-      <div className="text-center -mt-6">
-        <div className="text-3xl font-bold" style={{ color }}>
-          {clampedPercentage.toFixed(0)}%
+
+      {/* Distraction % */}
+      <div className="text-center -mt-4">
+        <div className="text-2xl font-bold" style={{ color }}>
+          {clamped.toFixed(0)}%
         </div>
-        <div className="text-xs text-gray-400 mt-1">Focus Score</div>
+        <div className="text-xs text-gray-400 mt-0.5">Distraction Level</div>
+      </div>
+
+      {/* Numeric counts */}
+      <div className="mt-3 flex items-center gap-3 text-sm">
+        <span className="text-red-400 font-semibold">{distractedCount} distracted</span>
+        <span className="text-gray-600">·</span>
+        <span className="text-gray-400">{totalCount} total</span>
       </div>
     </div>
   );
