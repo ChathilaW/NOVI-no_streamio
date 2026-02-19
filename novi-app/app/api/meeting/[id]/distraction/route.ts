@@ -1,91 +1,58 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { supabase } from '@/lib/supabase'
 
-interface DistractionEntry {
-  participantId: string
-  name: string
-  status: 'FOCUSED' | 'DISTRACTED' | 'NO FACE' | 'ERROR'
-  totalChecks: number
-  distractedChecks: number
-  peakDistractionPct: number
-  peakDistractionTime: number
-  lastSeen: number
-}
+const STALE_THRESHOLD_SECS = 10
 
-/**
- * In-memory relay store: meetingId → Map<participantId, DistractionEntry>
- *
- * The server is a STATELESS RELAY — all cumulative counters come from the
- * client in every POST body. The server just stores the latest snapshot and
- * prunes stale entries. This is safe on Vercel because the client is the
- * single source of truth for counts; any serverless instance can serve GETs
- * since it will receive fresh data in the next POST cycle (~200ms).
- */
-const meetingDistraction = new Map<string, Map<string, DistractionEntry>>()
-
-const STALE_THRESHOLD_MS = 10_000
-
-function getRoom(meetingId: string): Map<string, DistractionEntry> {
-  if (!meetingDistraction.has(meetingId)) {
-    meetingDistraction.set(meetingId, new Map())
-  }
-  return meetingDistraction.get(meetingId)!
-}
-
-function pruneStale(room: Map<string, DistractionEntry>) {
-  const now = Date.now()
-  for (const [id, entry] of room.entries()) {
-    if (now - entry.lastSeen > STALE_THRESHOLD_MS) {
-      room.delete(id)
-    }
-  }
-}
-
-/**
- * GET /api/meeting/[id]/distraction
- * Returns { distractedCount, totalCount, participants[] }
- */
+/** GET /api/meeting/[id]/distraction → { distractedCount, totalCount, participants[] } */
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params
-  const room = getRoom(id)
-  pruneStale(room)
+
+  const staleTime = new Date(Date.now() - STALE_THRESHOLD_SECS * 1000).toISOString()
+
+  const { data, error } = await supabase
+    .from('meeting_distraction')
+    .select('*')
+    .eq('meeting_id', id)
+    .gt('last_seen', staleTime)
+
+  if (error) {
+    console.error('[distraction GET]', error)
+    return NextResponse.json({ distractedCount: 0, totalCount: 0, participants: [] })
+  }
 
   let distractedCount = 0
   let totalCount = 0
-  const participants = []
-
-  for (const entry of room.values()) {
-    if (entry.status === 'FOCUSED' || entry.status === 'DISTRACTED') {
-      totalCount++
-      if (entry.status === 'DISTRACTED') distractedCount++
-    }
+  const participants = (data ?? []).map((row) => {
     const distractionPct =
-      entry.totalChecks > 0
-        ? Math.round((entry.distractedChecks / entry.totalChecks) * 100)
+      row.total_checks > 0
+        ? Math.round((row.distracted_checks / row.total_checks) * 100)
         : 0
-    participants.push({
-      participantId: entry.participantId,
-      name: entry.name,
-      totalChecks: entry.totalChecks,
-      distractedChecks: entry.distractedChecks,
+
+    if (row.status === 'FOCUSED' || row.status === 'DISTRACTED') {
+      totalCount++
+      if (row.status === 'DISTRACTED') distractedCount++
+    }
+
+    return {
+      participantId: row.participant_id,
+      name: row.name,
+      totalChecks: row.total_checks,
+      distractedChecks: row.distracted_checks,
       distractionPct,
-      peakDistractionPct: entry.peakDistractionPct,
-      peakDistractionTime: entry.peakDistractionTime,
-    })
-  }
+      peakDistractionPct: row.peak_distraction_pct,
+      peakDistractionTime: row.peak_distraction_time
+        ? new Date(row.peak_distraction_time).getTime()
+        : 0,
+    }
+  })
 
   return NextResponse.json({ distractedCount, totalCount, participants })
 }
 
-/**
- * POST /api/meeting/[id]/distraction
- * Body: { participantId, name, status, totalChecks, distractedChecks,
- *         peakDistractionPct, peakDistractionTime }
- *
- * Server simply overwrites — the client owns all counters.
- */
+/** POST /api/meeting/[id]/distraction — client sends full snapshot */
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -94,39 +61,50 @@ export async function POST(
   const body = await req.json() as {
     participantId: string
     name: string
-    status: DistractionEntry['status']
+    status: string
     totalChecks: number
     distractedChecks: number
     peakDistractionPct: number
     peakDistractionTime: number
   }
-  const room = getRoom(id)
 
-  // Pure overwrite — no server-side accumulation
-  room.set(body.participantId, {
-    participantId: body.participantId,
-    name: body.name,
-    status: body.status,
-    totalChecks: body.totalChecks ?? 0,
-    distractedChecks: body.distractedChecks ?? 0,
-    peakDistractionPct: body.peakDistractionPct ?? 0,
-    peakDistractionTime: body.peakDistractionTime ?? 0,
-    lastSeen: Date.now(),
-  })
+  const { error } = await supabase
+    .from('meeting_distraction')
+    .upsert({
+      meeting_id: id,
+      participant_id: body.participantId,
+      name: body.name,
+      status: body.status,
+      total_checks: body.totalChecks ?? 0,
+      distracted_checks: body.distractedChecks ?? 0,
+      peak_distraction_pct: body.peakDistractionPct ?? 0,
+      peak_distraction_time: body.peakDistractionTime
+        ? new Date(body.peakDistractionTime).toISOString()
+        : null,
+      last_seen: new Date().toISOString(),
+    }, { onConflict: 'meeting_id,participant_id' })
 
-  pruneStale(room)
+  if (error) console.error('[distraction POST]', error)
   return NextResponse.json({ ok: true })
 }
 
-/**
- * DELETE /api/meeting/[id]/distraction?participantId=xxx
- */
+/** DELETE /api/meeting/[id]/distraction?participantId=xxx */
 export async function DELETE(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   const { id } = await params
   const participantId = req.nextUrl.searchParams.get('participantId')
-  if (participantId) getRoom(id).delete(participantId)
+
+  if (participantId) {
+    const { error } = await supabase
+      .from('meeting_distraction')
+      .delete()
+      .eq('meeting_id', id)
+      .eq('participant_id', participantId)
+
+    if (error) console.error('[distraction DELETE]', error)
+  }
+
   return NextResponse.json({ ok: true })
 }
