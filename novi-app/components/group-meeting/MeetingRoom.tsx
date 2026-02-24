@@ -16,8 +16,6 @@ import GroupDashboard from './Group-Dashboard'
 import useCopyLink from '@/hooks/useCopyLink'
 import useParticipants from '@/hooks/useParticipants'
 import useDistractionDetection from '@/hooks/useDistractionDetection'
-import { useHostStream } from '@/hooks/useHostStream'
-import { useParticipantStream } from '@/hooks/useParticipantStream'
 
 interface MeetingRoomProps {
   meetingId: string
@@ -35,13 +33,7 @@ const MeetingRoom = ({
   description,
 }: MeetingRoomProps) => {
   const videoRef = useRef<HTMLVideoElement>(null)
-  // Separate ref for the participant's own PiP webcam
-  const pipVideoRef = useRef<HTMLVideoElement>(null)
-  // Ref for the full-screen host remote video (participant view)
-  const hostVideoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  // Track localStream in state so hooks that depend on it re-run when it changes
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null)
 
   const [isCameraOn, setIsCameraOn] = useState(initialCameraOn)
   const [isMicOn, setIsMicOn] = useState(initialMicOn)
@@ -71,34 +63,13 @@ const MeetingRoom = ({
 
   // Run distraction detection locally on this participant's webcam
   useDistractionDetection({
-    videoRef: isHost ? videoRef : pipVideoRef,
+    videoRef,
     meetingId,
     participantId,
     name: participantName,
     isCameraOn,
   })
 
-  // Derive the host's participant ID from the participants list
-  const hostParticipantId = participants.find((p) => p.isHost)?.id ?? null
-
-  // HOST: stream local webcam to all participants via WebRTC
-  useHostStream({
-    meetingId,
-    localStream,
-    enabled: isHost,
-    participants,
-    hostId: participantId,   // when isHost, our own ID is the host ID
-  })
-
-  // PARTICIPANT: receive host's webcam stream via WebRTC
-  const { hostStream } = useParticipantStream({
-    meetingId,
-    participantId,
-    hostId: hostParticipantId,
-    enabled: !isHost,
-  })
-
-  // Acquire local webcam/mic stream
   useEffect(() => {
     const startStream = async () => {
       try {
@@ -107,20 +78,10 @@ const MeetingRoom = ({
           audio: true,
         })
         streamRef.current = stream
-        setLocalStream(stream)
         stream.getVideoTracks().forEach((t) => (t.enabled = initialCameraOn))
         stream.getAudioTracks().forEach((t) => (t.enabled = initialMicOn))
-
-        if (isHost) {
-          // Host: show own webcam in the main video element
-          if (videoRef.current) {
-            videoRef.current.srcObject = stream
-          }
-        } else {
-          // Participant: show own webcam in the small PiP element
-          if (pipVideoRef.current) {
-            pipVideoRef.current.srcObject = stream
-          }
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream
         }
       } catch (err) {
         console.error('Could not access camera/mic:', err)
@@ -134,12 +95,6 @@ const MeetingRoom = ({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  // Attach host's remote stream to the full-screen video element (participant only)
-  useEffect(() => {
-    if (isHost || !hostVideoRef.current) return
-    hostVideoRef.current.srcObject = hostStream ?? null
-  }, [hostStream, isHost])
 
   const toggleCamera = () => {
     const next = !isCameraOn
@@ -183,87 +138,34 @@ const MeetingRoom = ({
         className="flex-1 flex items-stretch justify-center gap-3 px-4 pb-24 pt-3 min-h-0"
         style={{ maxWidth: anyPanelOpen ? '1400px' : '100%', margin: '0 auto', width: '100%' }}
       >
-        {/* ── HOST VIEW: own webcam full-screen ── */}
-        {isHost && (
-          <div className="relative flex-1 min-w-0 bg-gray-800 rounded-2xl overflow-hidden shadow-2xl">
-            {(cameraError || !isCameraOn) && (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
-                <div className="w-24 h-24 rounded-full bg-gray-700 flex items-center justify-center">
-                  <VideoCameraSlashIcon className="w-12 h-12 text-gray-400" />
-                </div>
-                <p className="text-gray-400 text-sm">
-                  {cameraError ? 'Camera unavailable' : 'Camera is off'}
-                </p>
+        {/* Video tile */}
+        <div className="relative flex-1 min-w-0 bg-gray-800 rounded-2xl overflow-hidden shadow-2xl">
+          {(cameraError || !isCameraOn) && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 z-10">
+              <div className="w-24 h-24 rounded-full bg-gray-700 flex items-center justify-center">
+                <VideoCameraSlashIcon className="w-12 h-12 text-gray-400" />
               </div>
-            )}
-            <video
-              ref={videoRef}
-              autoPlay
-              muted
-              playsInline
-              className={`w-full h-full object-cover scale-x-[-1] transition-opacity duration-300
-                ${isCameraOn && !cameraError ? 'opacity-100' : 'opacity-0'}`}
-            />
-            {!isMicOn && (
-              <div className="absolute bottom-3 left-3 z-20 bg-red-600/90 text-white text-xs
-                font-semibold px-2.5 py-1 rounded-full flex items-center gap-1.5">
-                <SpeakerXMarkIcon className="w-3.5 h-3.5" />
-                Muted
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ── PARTICIPANT VIEW: host video full-screen + own webcam PiP ── */}
-        {!isHost && (
-          <div className="relative flex-1 min-w-0 bg-gray-800 rounded-2xl overflow-hidden shadow-2xl">
-
-            {/* Host's remote video — full-screen */}
-            {hostStream ? (
-              <video
-                ref={hostVideoRef}
-                autoPlay
-                playsInline
-                className="w-full h-full object-cover"
-              />
-            ) : (
-              /* Waiting placeholder while WebRTC is connecting */
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3">
-                <div className="w-24 h-24 rounded-full bg-gray-700 flex items-center justify-center animate-pulse">
-                  <VideoCameraIcon className="w-12 h-12 text-gray-500" />
-                </div>
-                <p className="text-gray-400 text-sm">Waiting for host video…</p>
-              </div>
-            )}
-
-            {/* Own webcam — small PiP overlay, top-left */}
-            <div className="absolute top-3 left-3 z-20 w-40 h-24 rounded-xl overflow-hidden
-              shadow-xl border-2 border-gray-700/60 bg-gray-900">
-              {(cameraError || !isCameraOn) ? (
-                <div className="w-full h-full flex items-center justify-center bg-gray-800">
-                  <VideoCameraSlashIcon className="w-6 h-6 text-gray-500" />
-                </div>
-              ) : (
-                <video
-                  ref={pipVideoRef}
-                  autoPlay
-                  muted
-                  playsInline
-                  className="w-full h-full object-cover scale-x-[-1]"
-                />
-              )}
+              <p className="text-gray-400 text-sm">
+                {cameraError ? 'Camera unavailable' : 'Camera is off'}
+              </p>
             </div>
-
-            {/* Muted badge */}
-            {!isMicOn && (
-              <div className="absolute bottom-3 left-3 z-20 bg-red-600/90 text-white text-xs
-                font-semibold px-2.5 py-1 rounded-full flex items-center gap-1.5">
-                <SpeakerXMarkIcon className="w-3.5 h-3.5" />
-                Muted
-              </div>
-            )}
-          </div>
-        )}
+          )}
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            className={`w-full h-full object-cover scale-x-[-1] transition-opacity duration-300
+              ${isCameraOn && !cameraError ? 'opacity-100' : 'opacity-0'}`}
+          />
+          {!isMicOn && (
+            <div className="absolute bottom-3 left-3 z-20 bg-red-600/90 text-white text-xs
+              font-semibold px-2.5 py-1 rounded-full flex items-center gap-1.5">
+              <SpeakerXMarkIcon className="w-3.5 h-3.5" />
+              Muted
+            </div>
+          )}
+        </div>
 
         {/* Participants panel */}
         {showParticipants && (
