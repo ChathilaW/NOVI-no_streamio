@@ -1,162 +1,209 @@
 'use client'
 
 /**
- * useHostStream
+ * useHostStream — DB-polling approach
  *
- * Used ONLY by the host in a group meeting.
- * For every participant that appears in the Supabase Realtime presence channel,
- * this hook creates a WebRTC RTCPeerConnection, adds the host's local video track,
- * and exchanges SDP + ICE candidates via Supabase Realtime broadcast.
+ * Used ONLY by the host. For each non-host participant, creates one
+ * RTCPeerConnection, adds local video tracks, posts an SDP offer to the
+ * /api/meeting/[id]/signal endpoint, then polls for the SDP answer and ICE
+ * candidates and applies them.
  *
- * The hook is entirely client-side — no server changes required.
+ * Uses the same Supabase-backed REST API as the rest of the app.
+ * No Realtime / WebSocket dependency — zero timing races.
  */
 
 import { useEffect, useRef } from 'react'
-import { createClient } from '@supabase/supabase-js'
+import { Participant } from './useParticipants'
 
 const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
 
+const POLL_MS = 1500
+
 interface UseHostStreamOptions {
   meetingId: string
-  /** The host's local MediaStream (already acquired by Grp-MeetingRoom) */
   localStream: MediaStream | null
-  /** Whether the host is actually in host role */
   enabled: boolean
+  participants: Participant[]
+  hostId: string
 }
 
-export function useHostStream({ meetingId, localStream, enabled }: UseHostStreamOptions) {
-  // Map of participantId → RTCPeerConnection
+export function useHostStream({
+  meetingId,
+  localStream,
+  enabled,
+  participants,
+  hostId,
+}: UseHostStreamOptions) {
+  // Map: participantId → RTCPeerConnection
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map())
-  const channelRef = useRef<ReturnType<ReturnType<typeof createClient>['channel']> | null>(null)
+  // Track the latest `since` timestamp per participant to avoid re-processing old signals
+  const sinceRef = useRef<Map<string, string>>(new Map())
   const localStreamRef = useRef<MediaStream | null>(null)
 
-  // Keep localStreamRef in sync so the effect below always has the latest stream
+  // Always keep localStreamRef up to date
   useEffect(() => {
     localStreamRef.current = localStream
   }, [localStream])
 
+  // Helper: POST a signal
+  const postSignal = async (
+    fromId: string,
+    toId: string,
+    type: string,
+    payload: unknown
+  ) => {
+    try {
+      await fetch(`/api/meeting/${meetingId}/signal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromId, toId, type, payload }),
+      })
+    } catch (err) {
+      console.error('[useHostStream] postSignal error', err)
+    }
+  }
+
+  // Helper: GET new signals addressed to the host from a specific participant
+  const fetchSignals = async (fromParticipantId: string) => {
+    const key = `from-${fromParticipantId}`
+    const since = sinceRef.current.get(key) ?? new Date(0).toISOString()
+    try {
+      const res = await fetch(
+        `/api/meeting/${meetingId}/signal?toId=${encodeURIComponent(hostId)}&since=${encodeURIComponent(since)}`
+      )
+      const data = await res.json() as { signals: Array<{ type: string; payload: unknown; from_id: string; created_at: string }> }
+      const relevant = (data.signals ?? []).filter((s) => s.from_id === fromParticipantId)
+      if (relevant.length > 0) {
+        // Advance the cursor past the latest signal we've seen
+        sinceRef.current.set(
+          key,
+          relevant[relevant.length - 1].created_at
+        )
+      }
+      return relevant
+    } catch {
+      return []
+    }
+  }
+
+  // Helper: create and offer a peer connection to a participant
+  const connectPeer = async (participantId: string) => {
+    const stream = localStreamRef.current
+    if (!stream) return
+
+    const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS })
+    peersRef.current.set(participantId, pc)
+
+    // Add all local tracks
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream))
+
+    // When we generate ICE candidates, post them to the signal table
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        postSignal(hostId, participantId, 'ice', e.candidate.toJSON())
+      }
+    }
+
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        peersRef.current.delete(participantId)
+      }
+    }
+
+    try {
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      await postSignal(hostId, participantId, 'offer', pc.localDescription)
+    } catch (err) {
+      console.error('[useHostStream] createOffer error', err)
+    }
+
+    return pc
+  }
+
+  // React to participant list changes
   useEffect(() => {
-    if (!enabled || !meetingId) return
+    if (!enabled || !meetingId || !hostId) return
 
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    )
+    const nonHosts = participants.filter((p) => !p.isHost && p.id !== hostId)
+    const currentIds = new Set(nonHosts.map((p) => p.id))
 
-    const channelName = `webrtc-${meetingId}`
-    const channel = supabase.channel(channelName, {
-      config: { broadcast: { self: false } },
+    // Close peers for participants who left
+    peersRef.current.forEach((pc, id) => {
+      if (!currentIds.has(id)) {
+        pc.close()
+        peersRef.current.delete(id)
+        sinceRef.current.delete(`from-${id}`)
+      }
     })
-    channelRef.current = channel
 
-    /** Create (or return existing) peer connection for a given participant */
-    const getOrCreatePeer = (participantId: string): RTCPeerConnection => {
-      const existing = peersRef.current.get(participantId)
-      if (existing) return existing
-
-      const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS })
-      peersRef.current.set(participantId, pc)
-
-      // Add current video/audio tracks to this new peer connection
-      const stream = localStreamRef.current
-      if (stream) {
-        stream.getTracks().forEach((track) => pc.addTrack(track, stream))
+    // Connect to new participants
+    nonHosts.forEach((p) => {
+      if (!peersRef.current.has(p.id)) {
+        connectPeer(p.id)
       }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [participants, enabled, meetingId, hostId])
 
-      // When we get ICE candidates, broadcast them tagged for this participant
-      pc.onicecandidate = (e) => {
-        if (e.candidate) {
-          channel.send({
-            type: 'broadcast',
-            event: 'ice-candidate',
-            payload: {
-              from: 'host',
-              to: participantId,
-              candidate: e.candidate.toJSON(),
-            },
-          })
+  // Poll for answers and ICE candidates from each participant
+  useEffect(() => {
+    if (!enabled || !meetingId || !hostId) return
+
+    const interval = setInterval(async () => {
+      for (const [participantId, pc] of peersRef.current.entries()) {
+        const signals = await fetchSignals(participantId)
+
+        for (const sig of signals) {
+          if (sig.type === 'answer' && !pc.remoteDescription) {
+            try {
+              await pc.setRemoteDescription(
+                new RTCSessionDescription(sig.payload as RTCSessionDescriptionInit)
+              )
+            } catch (err) {
+              console.error('[useHostStream] setRemoteDescription error', err)
+            }
+          } else if (sig.type === 'ice') {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(sig.payload as RTCIceCandidateInit))
+            } catch {
+              // stale candidate — ignore
+            }
+          }
         }
       }
+    }, POLL_MS)
 
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-          peersRef.current.delete(participantId)
+    return () => clearInterval(interval)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, meetingId, hostId])
+
+  // Replace tracks on all existing peer connections when localStream changes
+  useEffect(() => {
+    if (!localStream) return
+    peersRef.current.forEach((pc) => {
+      pc.getSenders().forEach((sender) => {
+        if (sender.track?.kind === 'video') {
+          const vt = localStream.getVideoTracks()[0]
+          if (vt) sender.replaceTrack(vt)
         }
-      }
-
-      return pc
-    }
-
-    /** Initiate an offer to a specific participant */
-    const offerTo = async (participantId: string) => {
-      const pc = getOrCreatePeer(participantId)
-
-      // Guard: if already have a remote description, skip
-      if (pc.remoteDescription) return
-
-      try {
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-
-        channel.send({
-          type: 'broadcast',
-          event: 'sdp-offer',
-          payload: {
-            from: 'host',
-            to: participantId,
-            sdp: pc.localDescription,
-          },
-        })
-      } catch (err) {
-        console.error('[useHostStream] offer error', err)
-      }
-    }
-
-    channel
-      // A participant requests a stream — host sends them an offer
-      .on('broadcast', { event: 'request-stream' }, async ({ payload }) => {
-        const { from: participantId } = payload as { from: string }
-        await offerTo(participantId)
-      })
-      // Handle SDP answers from participants
-      .on('broadcast', { event: 'sdp-answer' }, async ({ payload }) => {
-        const { from: participantId, sdp } = payload as { from: string; sdp: RTCSessionDescriptionInit }
-        const pc = peersRef.current.get(participantId)
-        if (!pc || pc.remoteDescription) return
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-        } catch (err) {
-          console.error('[useHostStream] setRemoteDescription error', err)
+        if (sender.track?.kind === 'audio') {
+          const at = localStream.getAudioTracks()[0]
+          if (at) sender.replaceTrack(at)
         }
       })
-      // Handle ICE candidates from participants
-      .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
-        const { from: participantId, to, candidate } = payload as {
-          from: string
-          to: string
-          candidate: RTCIceCandidateInit
-        }
-        // Only process candidates addressed to the host
-        if (to !== 'host') return
-        const pc = peersRef.current.get(participantId)
-        if (!pc) return
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate))
-        } catch (err) {
-          console.error('[useHostStream] addIceCandidate error', err)
-        }
-      })
-      .subscribe()
+    })
+  }, [localStream])
 
+  // Cleanup on unmount
+  useEffect(() => {
     return () => {
-      // Clean up all peer connections on unmount
       peersRef.current.forEach((pc) => pc.close())
       peersRef.current.clear()
-      supabase.removeChannel(channel)
+      sinceRef.current.clear()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [meetingId, enabled])
+  }, [])
 }

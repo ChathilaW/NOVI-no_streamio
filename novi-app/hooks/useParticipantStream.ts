@@ -1,143 +1,149 @@
 'use client'
 
 /**
- * useParticipantStream
+ * useParticipantStream — DB-polling approach
  *
- * Used ONLY by non-host participants in a group meeting.
- * Connects to the Supabase Realtime signaling channel, requests a stream from
- * the host, and negotiates a WebRTC peer connection to receive the host's webcam.
+ * Used ONLY by non-host participants. Polls the /api/meeting/[id]/signal
+ * endpoint for an SDP offer from the host, answers it, then continues polling
+ * for ICE candidates. Returns the host's remote MediaStream once connected.
  *
- * Returns `hostStream` — the MediaStream from the host (or null while connecting).
+ * No Realtime / WebSocket dependency — signals are stored in Supabase and
+ * polled at regular intervals, so there are zero timing races.
  */
 
 import { useEffect, useRef, useState } from 'react'
-import { createClient } from '@supabase/supabase-js'
 
 const STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
 ]
 
+const POLL_MS = 1500
+
 interface UseParticipantStreamOptions {
   meetingId: string
   participantId: string
-  /** Set to false while the user is not yet a participant (e.g. setup screen) */
+  hostId: string | null   // null if we don't know the host yet
   enabled: boolean
 }
 
 export function useParticipantStream({
   meetingId,
   participantId,
+  hostId,
   enabled,
 }: UseParticipantStreamOptions) {
   const [hostStream, setHostStream] = useState<MediaStream | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
-  const channelRef = useRef<ReturnType<ReturnType<typeof createClient>['channel']> | null>(null)
+  const offeredRef = useRef(false)         // have we processed the offer?
+  const sinceRef = useRef(new Date(0).toISOString())
+  // Keep a ref to hostId so the ICE callback always has the latest value
+  const hostIdRef = useRef<string | null>(hostId)
+  useEffect(() => { hostIdRef.current = hostId }, [hostId])
 
   useEffect(() => {
     if (!enabled || !meetingId || !participantId) return
 
-    const supabase = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-    )
+    let cancelled = false
 
-    const channelName = `webrtc-${meetingId}`
-    const channel = supabase.channel(channelName, {
-      config: { broadcast: { self: false } },
-    })
-    channelRef.current = channel
-
-    const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS })
-    pcRef.current = pc
-
-    // When we receive a track from the host, expose it as hostStream
-    pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        setHostStream(event.streams[0])
+    // Helper: POST a signal
+    const postSignal = async (type: string, payload: unknown) => {
+      try {
+        await fetch(`/api/meeting/${meetingId}/signal`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fromId: participantId,
+            toId: hostIdRef.current ?? 'host',
+            type,
+            payload,
+          }),
+        })
+      } catch (err) {
+        console.error('[useParticipantStream] postSignal error', err)
       }
     }
 
-    // Forward our ICE candidates to the host via broadcast
+    // Create the peer connection
+    const pc = new RTCPeerConnection({ iceServers: STUN_SERVERS })
+    pcRef.current = pc
+
+    // When host's tracks arrive, expose them
+    pc.ontrack = (e) => {
+      if (e.streams?.[0]) setHostStream(e.streams[0])
+    }
+
+    // Post our ICE candidates to the host via the signal table
     pc.onicecandidate = (e) => {
       if (e.candidate) {
-        channel.send({
-          type: 'broadcast',
-          event: 'ice-candidate',
-          payload: {
-            from: participantId,
-            to: 'host',
-            candidate: e.candidate.toJSON(),
-          },
-        })
+        postSignal('ice', e.candidate.toJSON())
       }
     }
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed') {
-        // Connection failed — reset hostStream so the UI can show a reconnecting state
         setHostStream(null)
+        // Allow re-negotiation
+        offeredRef.current = false
       }
     }
 
-    channel
-      // Receive SDP offer from the host
-      .on('broadcast', { event: 'sdp-offer' }, async ({ payload }) => {
-        const { to, sdp } = payload as { to: string; sdp: RTCSessionDescriptionInit }
-        // Only process offers meant for us
-        if (to !== participantId) return
-        if (pc.remoteDescription) return // already negotiated
+    // Poll the signal table
+    const interval = setInterval(async () => {
+      if (cancelled) return
+      try {
+        const res = await fetch(
+          `/api/meeting/${meetingId}/signal?toId=${encodeURIComponent(participantId)}&since=${encodeURIComponent(sinceRef.current)}`
+        )
+        const data = await res.json() as {
+          signals: Array<{ type: string; payload: unknown; from_id: string; created_at: string }>
+        }
+        const signals = data.signals ?? []
 
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp))
-          const answer = await pc.createAnswer()
-          await pc.setLocalDescription(answer)
+        if (signals.length > 0) {
+          sinceRef.current = signals[signals.length - 1].created_at
+        }
 
-          channel.send({
-            type: 'broadcast',
-            event: 'sdp-answer',
-            payload: {
-              from: participantId,
-              sdp: pc.localDescription,
-            },
-          })
-        } catch (err) {
-          console.error('[useParticipantStream] answer error', err)
+        for (const sig of signals) {
+          // Only accept signals from the host (by their actual participant ID)
+          if (hostIdRef.current && sig.from_id !== hostIdRef.current) continue
+
+          if (sig.type === 'offer' && !offeredRef.current) {
+            offeredRef.current = true
+            try {
+              await pc.setRemoteDescription(
+                new RTCSessionDescription(sig.payload as RTCSessionDescriptionInit)
+              )
+              const answer = await pc.createAnswer()
+              await pc.setLocalDescription(answer)
+              await postSignal('answer', pc.localDescription)
+            } catch (err) {
+              console.error('[useParticipantStream] offer handling error', err)
+              offeredRef.current = false
+            }
+          } else if (sig.type === 'ice') {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(sig.payload as RTCIceCandidateInit))
+            } catch {
+              // stale candidate — ignore
+            }
+          }
         }
-      })
-      // Receive ICE candidates from the host (addressed to us)
-      .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
-        const { from, to, candidate } = payload as {
-          from: string
-          to: string
-          candidate: RTCIceCandidateInit
-        }
-        // Only process candidates from the host addressed to us
-        if (from !== 'host' || to !== participantId) return
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate))
-        } catch (err) {
-          console.error('[useParticipantStream] addIceCandidate error', err)
-        }
-      })
-      .subscribe((status) => {
-        if (status === 'SUBSCRIBED') {
-          // Announce ourselves to the host so it starts the offer flow
-          channel.send({
-            type: 'broadcast',
-            event: 'request-stream',
-            payload: { from: participantId },
-          })
-        }
-      })
+      } catch {
+        // network error — will retry
+      }
+    }, POLL_MS)
 
     return () => {
+      cancelled = true
+      clearInterval(interval)
       pc.close()
       pcRef.current = null
-      supabase.removeChannel(channel)
       setHostStream(null)
+      offeredRef.current = false
+      sinceRef.current = new Date(0).toISOString()
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingId, participantId, enabled])
 
   return { hostStream }

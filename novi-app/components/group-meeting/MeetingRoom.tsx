@@ -78,17 +78,23 @@ const MeetingRoom = ({
     isCameraOn,
   })
 
+  // Derive the host's participant ID from the participants list
+  const hostParticipantId = participants.find((p) => p.isHost)?.id ?? null
+
   // HOST: stream local webcam to all participants via WebRTC
   useHostStream({
     meetingId,
     localStream,
     enabled: isHost,
+    participants,
+    hostId: participantId,   // when isHost, our own ID is the host ID
   })
 
   // PARTICIPANT: receive host's webcam stream via WebRTC
   const { hostStream } = useParticipantStream({
     meetingId,
     participantId,
+    hostId: hostParticipantId,
     enabled: !isHost,
   })
 
